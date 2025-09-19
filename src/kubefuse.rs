@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    time::{Duration, UNIX_EPOCH},
+    sync::atomic::AtomicU64,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fuser::{self, FileAttr};
@@ -39,6 +40,15 @@ struct Node {
     content: NodeContent,
 }
 
+impl Node {
+    fn children_mut(&mut self) -> Option<&mut NodeChildren> {
+        match &mut self.content {
+            NodeContent::Children(children) => Some(children),
+            NodeContent::Bytes(_) => None,
+        }
+    }
+}
+
 type NodeChildren = HashMap<String, u64>;
 enum NodeContent {
     Bytes(Vec<u8>),
@@ -49,6 +59,7 @@ pub struct KubeFilesystem<'c> {
     core_client: CoreV1Client<'c>,
 
     inodes: InodeTable,
+    inode_counter: AtomicU64,
 }
 
 impl<'c> KubeFilesystem<'c> {
@@ -57,11 +68,17 @@ impl<'c> KubeFilesystem<'c> {
             core_client: CoreV1Client::new(rest_client),
 
             inodes: InodeTable::new(),
+            inode_counter: AtomicU64::new(2),
         }
     }
 }
 
 impl<'c> KubeFilesystem<'c> {
+    fn next_inode(&self) -> u64 {
+        self.inode_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn create_namespace_node(&mut self, inode: u64, namespace: &Namespace) {
         let creation_time = namespace
             .metadata
@@ -72,8 +89,8 @@ impl<'c> KubeFilesystem<'c> {
             .unwrap_or(UNIX_EPOCH);
 
         let mut children = NodeChildren::new();
-        let manifest_ino = inode + 1000; // FIXME: stable inode generation?
-        children.insert("manifest.yaml".to_string(), manifest_ino); // FIXME: stable inode generation?
+        let manifest_ino = self.next_inode();
+        children.insert("manifest.yaml".to_string(), manifest_ino);
 
         let ns_node = Node {
             name: namespace.metadata.name.clone().unwrap_or_default(),
@@ -96,6 +113,7 @@ impl<'c> KubeFilesystem<'c> {
             },
             content: NodeContent::Children(children),
         };
+        self.inodes.insert(ns_node.attrs.ino, ns_node);
 
         let ns_yaml = serde_yaml::to_string(namespace)
             .unwrap_or_default()
@@ -122,9 +140,123 @@ impl<'c> KubeFilesystem<'c> {
             },
             content: NodeContent::Bytes(ns_yaml),
         };
-
         self.inodes.insert(manifest_ino, manifest_node);
-        self.inodes.insert(ns_node.attrs.ino, ns_node);
+    }
+
+    fn namespace_inode(&self, namespace: &str) -> Option<u64> {
+        self.inodes.get(&1).and_then(|root| match &root.content {
+            NodeContent::Children(children) => children.get(namespace).copied(),
+            NodeContent::Bytes(_) => {
+                log::error!("root directory must not be a file");
+                return None;
+            }
+        })
+    }
+
+    fn namespace_children_mut(&mut self, namespace: &str) -> Option<&mut NodeChildren> {
+        let ns_inode = self.namespace_inode(namespace)?;
+        self.inodes.get_mut(&ns_inode)?.children_mut()
+    }
+
+    fn create_configmaps_node(&mut self, namespace: &str) {
+        let configmaps_inode = self.next_inode();
+
+        let ns_node_children = match self.namespace_children_mut(namespace) {
+            Some(children) => children,
+            None => {
+                log::error!("namespace {namespace} not found or does not contain children");
+                return;
+            }
+        };
+
+        let node_creation_time = SystemTime::now();
+        let mut cm_node = Node {
+            name: "configmaps".to_string(),
+            attrs: FileAttr {
+                ino: configmaps_inode,
+                size: 0,
+                blocks: 0,
+                atime: node_creation_time,
+                mtime: node_creation_time,
+                ctime: node_creation_time,
+                crtime: node_creation_time,
+                kind: fuser::FileType::Directory,
+                perm: 0o755,
+                nlink: 2, // FIXME: should be updated when we add children directories
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: BLOCK_SIZE,
+            },
+            content: NodeContent::Children(NodeChildren::new()),
+        };
+
+        ns_node_children.insert("configmaps".to_string(), configmaps_inode);
+
+        match self.core_client.configmaps(namespace).list() {
+            Err(e) => {
+                log::error!("configmaps fetch failed: {e}");
+            }
+            Ok(resp) => {
+                for item in resp.items.iter() {
+                    let name = match item.metadata.name.as_deref() {
+                        Some(n) => n,
+                        None => continue, // TODO: Should be an error? Should we panic?
+                    }
+                    .to_owned()
+                        + ".yaml";
+
+                    let cm_yaml = serde_yaml::to_string(item).unwrap_or_default().into_bytes();
+                    let cm_yaml_size = cm_yaml.len() as u64;
+                    let cm_ino = self.next_inode();
+
+                    let cm_creation_time = item
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .and_then(|t| t.0.timestamp().try_into().ok())
+                        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+                        .unwrap_or(UNIX_EPOCH);
+
+                    match &mut cm_node.content {
+                        NodeContent::Children(children) => {
+                            children.insert(name.to_string(), cm_ino);
+                        }
+                        NodeContent::Bytes(_) => {
+                            log::error!("configmaps directory must not be a file");
+                            return;
+                        }
+                    };
+                    self.inodes.insert(
+                        cm_ino,
+                        Node {
+                            name: name.to_string(),
+                            attrs: FileAttr {
+                                ino: cm_ino,
+                                size: cm_yaml_size,
+                                blocks: cm_yaml_size.div_ceil(u64::from(BLOCK_SIZE)),
+                                atime: cm_creation_time,
+                                mtime: cm_creation_time,
+                                ctime: cm_creation_time,
+                                crtime: cm_creation_time,
+                                kind: fuser::FileType::RegularFile,
+                                perm: 0o444,
+                                nlink: 1,
+                                uid: 1000,
+                                gid: 1000,
+                                rdev: 0,
+                                flags: 0,
+                                blksize: BLOCK_SIZE,
+                            },
+                            content: NodeContent::Bytes(cm_yaml),
+                        },
+                    );
+                }
+            }
+        }
+
+        self.inodes.insert(configmaps_inode, cm_node);
     }
 }
 
@@ -147,12 +279,12 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
                 Err(libc::EIO)
             }
             Ok(resp) => {
-                for (i, item) in resp.items.iter().enumerate() {
+                for item in resp.items.iter() {
                     let name = match item.metadata.name.as_deref() {
                         Some(n) => n,
                         None => continue, // TODO: Should be an error? Should we panic?
                     };
-                    let ino = 2 + i as u64; // FIXME: stable inode generation?
+                    let ino = self.next_inode();
                     self.create_namespace_node(ino, item);
 
                     if let Some(root) = self.inodes.get_mut(&1) {
@@ -168,6 +300,8 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
                             }
                         }
                     }
+
+                    self.create_configmaps_node(name);
                 }
                 Ok(())
             }
@@ -287,13 +421,6 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
         if let NodeContent::Bytes(data) = &node.content {
             let start = offset as usize;
             let end = std::cmp::min(start + size as usize, data.len());
-            log::debug!(
-                "read data len={} start={} end={} {}\n",
-                data.len(),
-                start,
-                end,
-                std::str::from_utf8(data).unwrap_or_default(),
-            );
             if start >= data.len() {
                 reply.data(&[]);
             } else {
@@ -303,7 +430,8 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        // should at least increase open file handles
+        // TODO: should at least increase open file handles
+        // TODO: only allow RDONLY
         reply.opened(0, 0);
     }
 
