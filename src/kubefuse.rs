@@ -71,9 +71,7 @@ impl<'c> KubeFilesystem<'c> {
             inode_counter: AtomicU64::new(2),
         }
     }
-}
 
-impl<'c> KubeFilesystem<'c> {
     fn next_inode(&self) -> u64 {
         self.inode_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
