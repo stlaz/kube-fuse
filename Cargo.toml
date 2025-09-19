@@ -8,5 +8,7 @@ clap = { version = "4", features = ["derive", "env"] }
 client_rs = { package = "client-rs", git = "https://github.com/stlaz/kube-client-rs.git", rev="e6061f16d90de86bf5d76ca56b5e10b387900fe" }
 env_logger = "0.11.8"
 fuser = "0.16.0"
+k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
 libc = "0.2.175"
 log = "0.4.28"
+serde_yaml = "0.9.34" # deprecated, but there is no real successor at the moment it seems

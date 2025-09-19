@@ -6,7 +6,11 @@ use std::{
 use fuser::{self, FileAttr};
 use libc;
 
+use k8s_openapi::api::core::v1::Namespace;
+
 use client_rs::{corev1::CoreV1Client, rest};
+
+const BLOCK_SIZE: u32 = 512;
 
 const ROOT_ATTR: FileAttr = FileAttr {
     ino: 1,
@@ -23,17 +27,22 @@ const ROOT_ATTR: FileAttr = FileAttr {
     gid: 1000,
     rdev: 0,
     flags: 0,
-    blksize: 512,
+    blksize: BLOCK_SIZE,
 };
 
 const TTL: Duration = Duration::from_secs(1);
 
 type InodeTable = HashMap<u64, Node>;
-type NodeChildren = HashMap<String, u64>;
 struct Node {
     name: String,
     attrs: FileAttr,
-    children: Option<NodeChildren>,
+    content: NodeContent,
+}
+
+type NodeChildren = HashMap<String, u64>;
+enum NodeContent {
+    Bytes(Vec<u8>),
+    Children(NodeChildren),
 }
 pub struct KubeFilesystem<'c> {
     // Add fields as necessary
@@ -52,6 +61,73 @@ impl<'c> KubeFilesystem<'c> {
     }
 }
 
+impl<'c> KubeFilesystem<'c> {
+    fn create_namespace_node(&mut self, inode: u64, namespace: &Namespace) {
+        let creation_time = namespace
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|t| t.0.timestamp().try_into().ok())
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap_or(UNIX_EPOCH);
+
+        let mut children = NodeChildren::new();
+        let manifest_ino = inode + 1000; // FIXME: stable inode generation?
+        children.insert("manifest.yaml".to_string(), manifest_ino); // FIXME: stable inode generation?
+
+        let ns_node = Node {
+            name: namespace.metadata.name.clone().unwrap_or_default(),
+            attrs: FileAttr {
+                ino: inode,
+                size: 0,
+                blocks: 0,
+                atime: creation_time,
+                mtime: creation_time,
+                ctime: creation_time,
+                crtime: creation_time,
+                kind: fuser::FileType::Directory,
+                perm: 0o755,
+                nlink: 2, // FIXME: should be updated when we add children directories
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: BLOCK_SIZE,
+            },
+            content: NodeContent::Children(children),
+        };
+
+        let ns_yaml = serde_yaml::to_string(namespace)
+            .unwrap_or_default()
+            .into_bytes();
+        let ns_yaml_size = ns_yaml.len() as u64;
+        let manifest_node = Node {
+            name: "manifest.yaml".to_string(),
+            attrs: FileAttr {
+                ino: manifest_ino,
+                size: ns_yaml_size,
+                blocks: ns_yaml_size.div_ceil(u64::from(BLOCK_SIZE)),
+                atime: creation_time,
+                mtime: creation_time,
+                ctime: creation_time,
+                crtime: creation_time,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o444,
+                nlink: 1,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: BLOCK_SIZE,
+            },
+            content: NodeContent::Bytes(ns_yaml),
+        };
+
+        self.inodes.insert(manifest_ino, manifest_node);
+        self.inodes.insert(ns_node.attrs.ino, ns_node);
+    }
+}
+
 impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
     fn init(
         &mut self,
@@ -61,11 +137,15 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
         let root_node = Node {
             name: "/".to_string(),
             attrs: ROOT_ATTR,
-            children: Some(NodeChildren::new()),
+            content: NodeContent::Children(NodeChildren::new()),
         };
         self.inodes.insert(1, root_node);
 
         match self.core_client.namespaces().list() {
+            Err(e) => {
+                log::error!("namespaces fetch failed: {e}");
+                Err(libc::EIO)
+            }
             Ok(resp) => {
                 for (i, item) in resp.items.iter().enumerate() {
                     let name = match item.metadata.name.as_deref() {
@@ -73,40 +153,23 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
                         None => continue, // TODO: Should be an error? Should we panic?
                     };
                     let ino = 2 + i as u64; // FIXME: stable inode generation?
-                    let ns_node = Node {
-                        name: name.to_string(),
-                        attrs: FileAttr {
-                            ino,
-                            size: 0,
-                            blocks: 0,
-                            atime: UNIX_EPOCH,
-                            mtime: UNIX_EPOCH,
-                            ctime: UNIX_EPOCH,
-                            crtime: UNIX_EPOCH,
-                            kind: fuser::FileType::Directory,
-                            perm: 0o755,
-                            nlink: 2,
-                            uid: 1000,
-                            gid: 1000,
-                            rdev: 0,
-                            flags: 0,
-                            blksize: 512,
-                        },
-                        children: None,
-                    };
-                    self.inodes.insert(ino, ns_node);
+                    self.create_namespace_node(ino, item);
 
                     if let Some(root) = self.inodes.get_mut(&1) {
-                        if let Some(children) = root.children.as_mut() {
-                            children.insert(name.to_string(), ino);
+                        match &mut root.content {
+                            // TODO: we should check that the file attributes's kind matches the content
+                            NodeContent::Children(children) => {
+                                children.insert(name.to_string(), ino);
+                                root.attrs.nlink += 1; // each child directory increases the link count of the parent
+                            }
+                            NodeContent::Bytes(_) => {
+                                log::error!("root directory must not be a file");
+                                return Err(libc::EIO);
+                            }
                         }
                     }
                 }
                 Ok(())
-            }
-            Err(e) => {
-                log::error!("namespaces fetch failed: {e}");
-                Err(libc::EIO)
             }
         }
     }
@@ -119,22 +182,19 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
         reply: fuser::ReplyEntry,
     ) {
         log::debug!("lookup parent={parent} name={name:?}\n");
-        let child_node = match self.inodes.get(&parent).and_then(|p| {
-            p.children
-                .as_ref()
-                .and_then(|children| {
-                    let child_name = name.to_str()?;
-                    children.get(child_name).copied()
-                })
-                .and_then(|inode| self.inodes.get(&inode))
-        }) {
-            Some(n) => n,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
+        let child_node = self.inodes.get(&parent).and_then(|p| match &p.content {
+            NodeContent::Children(children) => {
+                let child_name = name.to_str()?;
+                let child_inode = children.get(child_name).copied()?;
+                self.inodes.get(&child_inode)
             }
+            NodeContent::Bytes(_) => None,
+        });
+
+        match child_node {
+            Some(n) => reply.entry(&TTL, &n.attrs, 0),
+            None => reply.error(libc::ENOENT),
         };
-        reply.entry(&TTL, &child_node.attrs, 0);
     }
 
     fn getattr(
@@ -166,12 +226,17 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
             return;
         };
 
+        if node.attrs.kind != fuser::FileType::Directory {
+            reply.error(libc::ENOTDIR);
+            return;
+        }
+
         let mut entries = vec![
             (inode, fuser::FileType::Directory, "."),
             (1, fuser::FileType::Directory, ".."), // FIXME: should be pointing to the parent inode
         ];
 
-        if let Some(children) = node.children.as_ref() {
+        if let NodeContent::Children(children) = &node.content {
             for (name, &inode) in children.iter() {
                 if let Some(child_node) = self.inodes.get(&inode) {
                     entries.push((inode, child_node.attrs.kind, child_node.name.as_str()));
@@ -179,6 +244,10 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
                     log::warn!("child {name} with inode {inode} was not found in inodes table");
                 }
             }
+        } else {
+            // TODO: this should probably panic
+            reply.error(libc::ENOTDIR);
+            return;
         }
 
         for (i, entry) in entries.into_iter().skip(offset as usize).enumerate() {
@@ -188,5 +257,67 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
         }
         reply.ok();
         return;
+    }
+
+    fn read(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: fuser::ReplyData,
+    ) {
+        log::debug!(
+            "read ino={ino} fh={fh} offset={offset} size={size} flags={flags} lock_owner={:?}\n",
+            lock_owner
+        );
+        let Some(node) = self.inodes.get(&ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+
+        if node.attrs.kind != fuser::FileType::RegularFile {
+            reply.error(libc::EISDIR);
+            return;
+        }
+
+        if let NodeContent::Bytes(data) = &node.content {
+            let start = offset as usize;
+            let end = std::cmp::min(start + size as usize, data.len());
+            log::debug!(
+                "read data len={} start={} end={} {}\n",
+                data.len(),
+                start,
+                end,
+                std::str::from_utf8(data).unwrap_or_default(),
+            );
+            if start >= data.len() {
+                reply.data(&[]);
+            } else {
+                reply.data(&data[start..end]);
+            }
+        }
+    }
+
+    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        // should at least increase open file handles
+        reply.opened(0, 0);
+    }
+
+    fn release(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        // should at least release file handles
+        reply.ok();
     }
 }
