@@ -40,15 +40,6 @@ struct Node {
     content: NodeContent,
 }
 
-impl Node {
-    fn children_mut(&mut self) -> Option<&mut NodeChildren> {
-        match &mut self.content {
-            NodeContent::Children(children) => Some(children),
-            NodeContent::Bytes(_) => None,
-        }
-    }
-}
-
 type NodeChildren = HashMap<String, u64>;
 enum NodeContent {
     Bytes(Vec<u8>),
@@ -77,7 +68,7 @@ impl<'c> KubeFilesystem<'c> {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn create_namespace_node(&mut self, inode: u64, namespace: &Namespace) {
+    fn create_namespace_node(&mut self, parent_inode: u64, namespace: &Namespace) -> Option<u64> {
         let creation_time = namespace
             .metadata
             .creation_timestamp
@@ -86,59 +77,23 @@ impl<'c> KubeFilesystem<'c> {
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap_or(UNIX_EPOCH);
 
-        let mut children = NodeChildren::new();
-        let manifest_ino = self.next_inode();
-        children.insert("manifest.yaml".to_string(), manifest_ino);
-
-        let ns_node = Node {
-            name: namespace.metadata.name.clone().unwrap_or_default(),
-            attrs: FileAttr {
-                ino: inode,
-                size: 0,
-                blocks: 0,
-                atime: creation_time,
-                mtime: creation_time,
-                ctime: creation_time,
-                crtime: creation_time,
-                kind: fuser::FileType::Directory,
-                perm: 0o755,
-                nlink: 2, // FIXME: should be updated when we add children directories
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                flags: 0,
-                blksize: BLOCK_SIZE,
-            },
-            content: NodeContent::Children(children),
+        let ns_name = match namespace.metadata.name.as_deref() {
+            Some(n) => n,
+            None => {
+                log::error!("namespace name is required");
+                return None;
+            }
         };
-        self.inodes.insert(ns_node.attrs.ino, ns_node);
+
+        let ns_inode = self.create_dir_node(parent_inode, ns_name)?;
 
         let ns_yaml = serde_yaml::to_string(namespace)
             .unwrap_or_default()
             .into_bytes();
-        let ns_yaml_size = ns_yaml.len() as u64;
-        let manifest_node = Node {
-            name: "manifest.yaml".to_string(),
-            attrs: FileAttr {
-                ino: manifest_ino,
-                size: ns_yaml_size,
-                blocks: ns_yaml_size.div_ceil(u64::from(BLOCK_SIZE)),
-                atime: creation_time,
-                mtime: creation_time,
-                ctime: creation_time,
-                crtime: creation_time,
-                kind: fuser::FileType::RegularFile,
-                perm: 0o444,
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                flags: 0,
-                blksize: BLOCK_SIZE,
-            },
-            content: NodeContent::Bytes(ns_yaml),
-        };
-        self.inodes.insert(manifest_ino, manifest_node);
+
+        self.create_content_node(ns_inode, "manifest.yaml", ns_yaml, creation_time); // FIXME: should use the actual namespace creation time
+
+        return Some(ns_inode);
     }
 
     fn namespace_inode(&self, namespace: &str) -> Option<u64> {
@@ -151,27 +106,59 @@ impl<'c> KubeFilesystem<'c> {
         })
     }
 
-    fn namespace_children_mut(&mut self, namespace: &str) -> Option<&mut NodeChildren> {
-        let ns_inode = self.namespace_inode(namespace)?;
-        self.inodes.get_mut(&ns_inode)?.children_mut()
-    }
-
-    fn create_configmaps_node(&mut self, namespace: &str) {
-        let configmaps_inode = self.next_inode();
-
-        let ns_node_children = match self.namespace_children_mut(namespace) {
-            Some(children) => children,
+    fn create_configmaps_node(&mut self, namespace: &str) -> Option<u64> {
+        let ns_inode = match self.namespace_inode(namespace) {
+            Some(ns_inode) => ns_inode,
             None => {
                 log::error!("namespace {namespace} not found or does not contain children");
-                return;
+                return None;
             }
         };
 
+        let cm_inode = self
+            .create_dir_node(ns_inode, "configmaps")
+            .expect("failed to create configmaps directory node");
+
+        match self.core_client.configmaps(namespace).list() {
+            Err(e) => {
+                log::error!("configmaps fetch failed: {e}");
+                return None;
+            }
+            Ok(resp) => {
+                for item in resp.items.iter() {
+                    let name = match item.metadata.name.as_deref() {
+                        Some(n) => n,
+                        None => continue, // TODO: Should be an error? Should we panic?
+                    }
+                    .to_owned()
+                        + ".yaml";
+
+                    let cm_yaml = serde_yaml::to_string(item).unwrap_or_default().into_bytes();
+
+                    let cm_creation_time = item
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .and_then(|t| t.0.timestamp().try_into().ok())
+                        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+                        .unwrap_or(UNIX_EPOCH);
+
+                    self.create_content_node(cm_inode, &name, cm_yaml, cm_creation_time)
+                        .expect("failed to create configmap content node");
+                }
+            }
+        }
+        return Some(cm_inode);
+    }
+
+    fn create_dir_node(&mut self, parent_inode: u64, name: &str) -> Option<u64> {
+        let new_inode = self.next_inode();
+
         let node_creation_time = SystemTime::now();
-        let mut cm_node = Node {
-            name: "configmaps".to_string(),
+        let new_node = Node {
+            name: name.to_string(),
             attrs: FileAttr {
-                ino: configmaps_inode,
+                ino: new_inode,
                 size: 0,
                 blocks: 0,
                 atime: node_creation_time,
@@ -190,71 +177,76 @@ impl<'c> KubeFilesystem<'c> {
             content: NodeContent::Children(NodeChildren::new()),
         };
 
-        ns_node_children.insert("configmaps".to_string(), configmaps_inode);
+        let Some(parent_node) = self.inodes.get_mut(&parent_inode) else {
+            log::error!("failed to create dir '{name}': parent inode {parent_inode} not found");
+            return None;
+        };
 
-        match self.core_client.configmaps(namespace).list() {
-            Err(e) => {
-                log::error!("configmaps fetch failed: {e}");
+        match &mut parent_node.content {
+            NodeContent::Children(children) => {
+                children.insert(name.to_string(), new_inode);
+                parent_node.attrs.nlink += 1; // each child directory increases the link count of the parent
             }
-            Ok(resp) => {
-                for item in resp.items.iter() {
-                    let name = match item.metadata.name.as_deref() {
-                        Some(n) => n,
-                        None => continue, // TODO: Should be an error? Should we panic?
-                    }
-                    .to_owned()
-                        + ".yaml";
-
-                    let cm_yaml = serde_yaml::to_string(item).unwrap_or_default().into_bytes();
-                    let cm_yaml_size = cm_yaml.len() as u64;
-                    let cm_ino = self.next_inode();
-
-                    let cm_creation_time = item
-                        .metadata
-                        .creation_timestamp
-                        .as_ref()
-                        .and_then(|t| t.0.timestamp().try_into().ok())
-                        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
-                        .unwrap_or(UNIX_EPOCH);
-
-                    match &mut cm_node.content {
-                        NodeContent::Children(children) => {
-                            children.insert(name.to_string(), cm_ino);
-                        }
-                        NodeContent::Bytes(_) => {
-                            log::error!("configmaps directory must not be a file");
-                            return;
-                        }
-                    };
-                    self.inodes.insert(
-                        cm_ino,
-                        Node {
-                            name: name.to_string(),
-                            attrs: FileAttr {
-                                ino: cm_ino,
-                                size: cm_yaml_size,
-                                blocks: cm_yaml_size.div_ceil(u64::from(BLOCK_SIZE)),
-                                atime: cm_creation_time,
-                                mtime: cm_creation_time,
-                                ctime: cm_creation_time,
-                                crtime: cm_creation_time,
-                                kind: fuser::FileType::RegularFile,
-                                perm: 0o444,
-                                nlink: 1,
-                                uid: 1000,
-                                gid: 1000,
-                                rdev: 0,
-                                flags: 0,
-                                blksize: BLOCK_SIZE,
-                            },
-                            content: NodeContent::Bytes(cm_yaml),
-                        },
-                    );
-                }
+            NodeContent::Bytes(_) => {
+                log::error!("parent node must be a directory");
+                return None;
             }
         }
 
-        self.inodes.insert(configmaps_inode, cm_node);
+        self.inodes.insert(new_inode, new_node);
+        return Some(new_inode);
+    }
+
+    fn create_content_node(
+        &mut self,
+        parent_inode: u64,
+        name: &str,
+        content: Vec<u8>,
+        creation_time: SystemTime,
+    ) -> Option<u64> {
+        let new_inode = self.next_inode();
+        let content_size = content.len() as u64;
+
+        let new_node = Node {
+            name: name.to_string(),
+            attrs: FileAttr {
+                ino: new_inode,
+                size: content_size,
+                blocks: content_size.div_ceil(u64::from(BLOCK_SIZE)),
+                atime: creation_time,
+                mtime: creation_time,
+                ctime: creation_time,
+                crtime: creation_time,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o444,
+                nlink: 1,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: BLOCK_SIZE,
+            },
+            content: NodeContent::Bytes(content),
+        };
+
+        let Some(parent_node) = self.inodes.get_mut(&parent_inode) else {
+            log::error!("parent inode {parent_inode} not found");
+            return None;
+        };
+
+        match &mut parent_node.content {
+            NodeContent::Children(children) => {
+                children.insert(name.to_string(), new_inode);
+                parent_node.attrs.nlink += 1; // each child directory increases the link count of the parent
+            }
+            NodeContent::Bytes(_) => {
+                log::error!("parent node must be a directory");
+                return None;
+            }
+        }
+
+        self.inodes.insert(new_inode, new_node);
+        return Some(new_inode);
     }
 }
 
@@ -269,7 +261,9 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
             attrs: ROOT_ATTR,
             content: NodeContent::Children(NodeChildren::new()),
         };
-        self.inodes.insert(1, root_node);
+
+        let root_inode = root_node.attrs.ino;
+        self.inodes.insert(root_inode, root_node);
 
         match self.core_client.namespaces().list() {
             Err(e) => {
@@ -282,23 +276,7 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
                         Some(n) => n,
                         None => continue, // TODO: Should be an error? Should we panic?
                     };
-                    let ino = self.next_inode();
-                    self.create_namespace_node(ino, item);
-
-                    if let Some(root) = self.inodes.get_mut(&1) {
-                        match &mut root.content {
-                            // TODO: we should check that the file attributes's kind matches the content
-                            NodeContent::Children(children) => {
-                                children.insert(name.to_string(), ino);
-                                root.attrs.nlink += 1; // each child directory increases the link count of the parent
-                            }
-                            NodeContent::Bytes(_) => {
-                                log::error!("root directory must not be a file");
-                                return Err(libc::EIO);
-                            }
-                        }
-                    }
-
+                    self.create_namespace_node(root_inode, item);
                     self.create_configmaps_node(name);
                 }
                 Ok(())
