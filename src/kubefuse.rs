@@ -237,7 +237,6 @@ impl<'c> KubeFilesystem<'c> {
         match &mut parent_node.content {
             NodeContent::Children(children) => {
                 children.insert(name.to_string(), new_inode);
-                parent_node.attrs.nlink += 1; // each child directory increases the link count of the parent
             }
             NodeContent::Bytes(_) => {
                 log::error!("parent node must be a directory");
