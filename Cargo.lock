@@ -799,6 +799,7 @@ dependencies = [
  "k8s-openapi",
  "libc",
  "log",
+ "reqwest",
  "serde_yaml",
 ]
 

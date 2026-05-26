@@ -11,4 +11,5 @@ fuser = "0.16.0"
 k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
 libc = "0.2.175"
 log = "0.4.28"
+reqwest = { version = "0.12.23", features = ["blocking", "json"] }
 serde_yaml = "0.9.34" # deprecated, but there is no real successor at the moment it seems

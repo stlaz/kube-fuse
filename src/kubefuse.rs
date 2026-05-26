@@ -7,7 +7,9 @@ use std::{
 use fuser::{self, FileAttr};
 use libc;
 
-use k8s_openapi::api::core::v1::Namespace;
+use reqwest;
+
+use k8s_openapi::{api::core::v1::Namespace, serde};
 
 use client_rs::{corev1::CoreV1Client, rest};
 
@@ -77,13 +79,11 @@ impl<'c> KubeFilesystem<'c> {
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
             .unwrap_or(UNIX_EPOCH);
 
-        let ns_name = match namespace.metadata.name.as_deref() {
-            Some(n) => n,
-            None => {
-                log::error!("namespace name is required");
-                return None;
-            }
-        };
+        let ns_name = namespace
+            .metadata
+            .name
+            .as_deref()
+            .expect("namespace name is required");
 
         let ns_inode = self.create_dir_node(parent_inode, ns_name)?;
 
@@ -106,7 +106,15 @@ impl<'c> KubeFilesystem<'c> {
         })
     }
 
-    fn create_configmaps_node(&mut self, namespace: &str) -> Option<u64> {
+    fn create_manifests_node<T: k8s_openapi::ListableResource>(
+        &mut self,
+        namespace: &str,
+        list_result: Result<k8s_openapi::List<T>, reqwest::Error>,
+    ) -> Option<u64>
+    where
+        T: k8s_openapi::Metadata<Ty = k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta>
+            + serde::Serialize,
+    {
         let ns_inode = match self.namespace_inode(namespace) {
             Some(ns_inode) => ns_inode,
             None => {
@@ -115,40 +123,46 @@ impl<'c> KubeFilesystem<'c> {
             }
         };
 
-        let cm_inode = self
-            .create_dir_node(ns_inode, "configmaps")
-            .expect("failed to create configmaps directory node");
+        let resource_kind = T::KIND.to_lowercase() + "s";
+        let manifests_inode = self
+            .create_dir_node(ns_inode, resource_kind.as_str())
+            .expect("failed to create manifests directory node");
 
-        match self.core_client.configmaps(namespace).list() {
+        let resource_list = match list_result {
             Err(e) => {
-                log::error!("configmaps fetch failed: {e}");
+                log::error!("manifests fetch failed for namespace {namespace}: {e}");
                 return None;
             }
-            Ok(resp) => {
-                for item in resp.items.iter() {
-                    let name = match item.metadata.name.as_deref() {
-                        Some(n) => n,
-                        None => continue, // TODO: Should be an error? Should we panic?
-                    }
-                    .to_owned()
-                        + ".yaml";
+            Ok(list) => list,
+        };
 
-                    let cm_yaml = serde_yaml::to_string(item).unwrap_or_default().into_bytes();
-
-                    let cm_creation_time = item
-                        .metadata
-                        .creation_timestamp
-                        .as_ref()
-                        .and_then(|t| t.0.timestamp().try_into().ok())
-                        .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
-                        .unwrap_or(UNIX_EPOCH);
-
-                    self.create_content_node(cm_inode, &name, cm_yaml, cm_creation_time)
-                        .expect("failed to create configmap content node");
-                }
+        for item in resource_list.items.iter() {
+            let name = match item.metadata().name.as_deref() {
+                Some(n) => n,
+                None => continue, // TODO: Should be an error? Should we panic?
             }
+            .to_owned()
+                + ".yaml";
+
+            let manifest_yaml = serde_yaml::to_string(item).unwrap_or_default().into_bytes();
+
+            let manifest_creation_time = item
+                .metadata()
+                .creation_timestamp
+                .as_ref()
+                .and_then(|t| t.0.timestamp().try_into().ok())
+                .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap_or(UNIX_EPOCH);
+
+            self.create_content_node(
+                manifests_inode,
+                &name,
+                manifest_yaml,
+                manifest_creation_time,
+            )
+            .expect("failed to create manifest content node");
         }
-        return Some(cm_inode);
+        return Some(manifests_inode);
     }
 
     fn create_dir_node(&mut self, parent_inode: u64, name: &str) -> Option<u64> {
@@ -271,12 +285,17 @@ impl<'c> fuser::Filesystem for KubeFilesystem<'c> {
             }
             Ok(resp) => {
                 for item in resp.items.iter() {
-                    let name = match item.metadata.name.as_deref() {
+                    let ns_name = match item.metadata.name.as_deref() {
                         Some(n) => n,
                         None => continue, // TODO: Should be an error? Should we panic?
                     };
                     self.create_namespace_node(root_inode, item);
-                    self.create_configmaps_node(name);
+
+                    self.create_manifests_node(
+                        ns_name,
+                        self.core_client.configmaps(ns_name).list(),
+                    );
+                    self.create_manifests_node(ns_name, self.core_client.secrets(ns_name).list());
                 }
                 Ok(())
             }
